@@ -4,6 +4,10 @@ import {
   context,
   demoAnalysis,
   segments,
+  expandedSchema,
+  demoExpanded,
+  toCompact,
+  resolveAnalysis,
 } from "../lib/analysis";
 
 describe("exact text segmentation", () => {
@@ -67,8 +71,8 @@ describe("context boundaries", () => {
 describe("structured analysis contract and explicit fixtures", () => {
   it.each([
     ["de", "beschloss", "Er beschloss zu gehen.", "beschließen", "Präteritum"],
-    ["de", "steht", "Er steht früh auf.", "aufstehen", "отделяемый"],
-    ["en", "gave up", "She gave up smoking.", "give up", "фразовый"],
+    ["de", "steht", "Er steht früh auf.", "aufstehen", "Präsens"],
+    ["en", "gave up", "She gave up smoking.", "give up", "Past Simple"],
     [
       "es",
       "habíamos hablado",
@@ -83,9 +87,12 @@ describe("structured analysis contract and explicit fixtures", () => {
       expect(result.original_word).toBe(word);
       expect(result.original_sentence).toBe(sentence);
       expect(result.lemma).toBe(lemma);
-      expect(result.grammar_explanation_ru).toContain(grammar);
-      expect(result.contextual_explanation_ru).toContain("тестовая");
-      expect(result.ambiguity_notes_ru).toContain("Деморежим");
+      expect(JSON.stringify(result.morphology)).toContain(grammar);
+      expect(result.usage_note_ru).toBeNull();
+      expect(expandedSchema.parse(demoExpanded(result)).meaning_ru).toContain(
+        "Демо",
+      );
+      expect(result).not.toHaveProperty("part_of_speech");
     },
   );
   it("accepts null for inapplicable grammar and rejects malformed or incomplete output", () => {
@@ -98,11 +105,94 @@ describe("structured analysis contract and explicit fixtures", () => {
       analysisSchema.safeParse({ ...result, language: "ru" }).success,
     ).toBe(false);
     expect(
-      analysisSchema.safeParse({
-        ...result,
+      expandedSchema.safeParse({
+        ...demoExpanded(result),
         alternative_meanings_ru: ["a", "b", "c", "d"],
       }).success,
     ).toBe(false);
     expect(analysisSchema.safeParse({ lemma: "word" }).success).toBe(false);
+  });
+});
+
+describe("compact source and legacy conversion", () => {
+  it("strips every expanded/legacy explanation from existing saved rows", () => {
+    const a = demoAnalysis("beschloss", "Er beschloss zu gehen.", "de");
+    const legacy = {
+      ...a,
+      morphology: { ...a.morphology, other: "Длинное старое объяснение" },
+      grammar_explanation_ru: "Präteritum, единственное число",
+      part_of_speech: "глагол",
+      contextual_explanation_ru: "EXTENDED",
+      example_original: "EXAMPLE",
+      alternative_meanings_ru: ["OTHER"],
+    };
+    delete (legacy as Partial<typeof legacy>).dictionary_translation_ru;
+    delete (legacy as Partial<typeof legacy>).construction;
+    delete (legacy as Partial<typeof legacy>).usage_note_ru;
+    delete (legacy as Partial<typeof legacy>).ambiguity_note_ru;
+    const result = toCompact(legacy);
+    expect(result.morphology.other).toBeNull();
+    expect(result.morphology.tense).toBe("Präteritum");
+    expect(JSON.stringify(result)).not.toMatch(
+      /EXTENDED|EXAMPLE|OTHER|part_of_speech|Длинное/,
+    );
+  });
+  it.each(["steht", "auf"])(
+    "links a separated prefix when selecting %s",
+    (word) => {
+      const text = "Vorher. Er steht heute sehr früh auf.";
+      const sentence = "Er steht heute sehr früh auf.";
+      const start = text.indexOf(word);
+      const fixture = demoAnalysis(word, sentence, "de");
+      const raw = {
+        ...fixture,
+        construction: { ...fixture.construction!, parts: ["steht", "auf"] },
+      };
+      const result = resolveAnalysis(raw, {
+        text,
+        sentence,
+        selected: word,
+        start,
+        language: "de",
+      });
+      expect(result.lemma).toBe("aufstehen");
+      expect(
+        result.construction?.parts.map((p) => text.slice(p.start, p.end)),
+      ).toEqual(["steht", "auf"]);
+      expect(result.construction?.parts[0].start).toBe(text.indexOf("steht"));
+    },
+  );
+  it("does not turn an independent preposition into an unrelated construction", () => {
+    const result = demoAnalysis("auf", "Das Buch liegt auf dem Tisch.", "de");
+    expect(result.construction).toBeNull();
+  });
+  it("rejects invented components and a construction not containing the selection", () => {
+    const text = "Er steht früh auf.";
+    const fixture = demoAnalysis("steht", text, "de");
+    const source = {
+      text,
+      sentence: text,
+      selected: "steht",
+      start: text.indexOf("steht"),
+      language: "de" as const,
+    };
+    expect(() =>
+      resolveAnalysis(
+        {
+          ...fixture,
+          construction: { ...fixture.construction, parts: ["steht", "weg"] },
+        },
+        source,
+      ),
+    ).toThrow();
+  });
+  it("does not duplicate an identical dictionary translation", () => {
+    const text = "Er beschloss zu gehen.";
+    const a = demoAnalysis("beschloss", text, "de");
+    const result = resolveAnalysis(
+      { ...a, dictionary_translation_ru: "  РЕШИЛ " },
+      { text, sentence: text, selected: "beschloss", start: 3, language: "de" },
+    );
+    expect(result.dictionary_translation_ru).toBeNull();
   });
 });

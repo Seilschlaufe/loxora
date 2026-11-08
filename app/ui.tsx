@@ -5,15 +5,21 @@ import { usePathname } from "next/navigation";
 import type { Session } from "@supabase/supabase-js";
 import { browserDb } from "@/lib/supabase";
 import { readLocal, writeLocal, clearScope } from "@/lib/local";
+import AnalysisCard from "./analysis-card";
+import { requestAnalysis, type AnalysisSource } from "@/lib/analysis-client";
+import {
+  compactEntry,
+  compactEntries,
+  vocabularyExport,
+} from "@/lib/vocabulary";
 import {
   Analysis,
   Document,
   Entry,
-  analysisSchema,
   context,
-  demoAnalysis,
-  PROMPT_VERSION,
   segments,
+  toCompact,
+  type ExpandedAnalysis,
 } from "@/lib/analysis";
 
 const langs = { de: "Немецкий", en: "Английский", es: "Испанский" };
@@ -33,7 +39,12 @@ type Snapshot = {
   prefs: Prefs;
   selected: string;
 };
-type Card = { analysis: Analysis; demo: boolean; document_id: string };
+type Card = {
+  analysis: Analysis;
+  demo: boolean;
+  document_id: string | null;
+  source: AnalysisSource;
+};
 type InstallEvent = Event & { prompt: () => Promise<void> };
 const empty: Snapshot = {
   docs: [],
@@ -72,7 +83,9 @@ export default function Lexora() {
     [content, setContent] = useState(""),
     [lang, setLang] = useState<"de" | "en" | "es">("de");
   const [card, setCard] = useState<Card | null>(null),
-    [detail, setDetail] = useState(false),
+    [expanded, setExpanded] = useState<ExpandedAnalysis | null>(null),
+    [expandedLoading, setExpandedLoading] = useState(false),
+    [expandedError, setExpandedError] = useState<string | null>(null),
     [busy, setBusy] = useState(false),
     [saving, setSaving] = useState(false);
   const [selection, setSelection] = useState<{
@@ -85,8 +98,7 @@ export default function Lexora() {
     [install, setInstall] = useState<InstallEvent | null>(null);
   const reader = useRef<HTMLDivElement>(null),
     requestId = useRef(0),
-    abort = useRef<AbortController | null>(null),
-    inflight = useRef(new Map<string, Promise<Analysis>>());
+    abort = useRef<AbortController | null>(null);
   const selected =
     state.docs.find((d) => d.id === state.selected) || state.docs[0];
   const tokens = useMemo(
@@ -154,6 +166,7 @@ export default function Lexora() {
             scope === "demo"
               ? { ...empty, docs: [demoDoc], selected: demoDoc.id }
               : empty;
+        local = { ...local, entries: compactEntries(local.entries) };
         if (alive) setState(local);
         if (session && db && navigator.onLine) {
           const results = await Promise.all([
@@ -173,9 +186,7 @@ export default function Lexora() {
               "Не удалось загрузить данные из облака. Доступна локальная копия.",
             );
           const docs = results[0].data as Document[],
-            entries = (results[1].data || []).filter(
-              (e) => analysisSchema.safeParse(e.analysis).success,
-            ) as Entry[];
+            entries = compactEntries(results[1].data);
           const progress = Object.fromEntries(
             (results[2].data || []).map((p) => [p.document_id, p.position]),
           );
@@ -446,7 +457,9 @@ export default function Lexora() {
     }
     setSelection(null);
     setCard(null);
-    setDetail(false);
+    setExpanded(null);
+    setExpandedError(null);
+    setExpandedLoading(false);
     setBusy(true);
     if (rect) {
       const width = Math.min(420, window.innerWidth - 24);
@@ -457,61 +470,81 @@ export default function Lexora() {
         y: rect.bottom + 8,
       });
     }
-    const sentence = context(doc.content, start, end, doc.language),
-      key = JSON.stringify([PROMPT_VERSION, doc.language, word, sentence]);
+    const sentence = context(doc.content, start, end, doc.language);
+    const source: AnalysisSource = {
+      document_id: doc.id,
+      selected: word,
+      start,
+      end,
+    };
+    const controller = new AbortController();
+    abort.current = controller;
     try {
-      let analysis = await readLocal<Analysis>(owner + ":analysis:" + key);
-      if (!analysis) {
-        if (!navigator.onLine)
-          throw Error(
-            "Нет подключения. Ранее разобранные слова доступны из кэша; новый анализ требует интернет.",
-          );
-        if (!session) {
-          analysis = demoAnalysis(word, sentence, doc.language);
-        } else {
-          let pending = inflight.current.get(key);
-          if (!pending) {
-            const controller = new AbortController();
-            abort.current = controller;
-            pending = fetch("/api/analyze", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-                Authorization: `Bearer ${session.access_token}`,
-              },
-              body: JSON.stringify({
-                document_id: doc.id,
-                selected: word,
-                start,
-                end,
-              }),
-              signal: controller.signal,
-            })
-              .then(async (r) => {
-                const data = await r.json();
-                if (!r.ok) throw Error(data.error || "Ошибка анализа");
-                return analysisSchema.parse(data.analysis);
-              })
-              .finally(() => inflight.current.delete(key));
-            inflight.current.set(key, pending);
-          }
-          analysis = await pending;
-        }
-        if (owner === scopeRef.current && epoch === dataEpoch.current)
-          await writeLocal(owner + ":analysis:" + key, analysis);
-      }
+      const analysis = await requestAnalysis({
+        mode: "compact",
+        scope: owner,
+        token: session?.access_token,
+        source,
+        selection: {
+          word,
+          sentence,
+          language: doc.language,
+          sentenceOffset: doc.content.lastIndexOf(sentence, start),
+        },
+        signal: controller.signal,
+        canStore: () =>
+          owner === scopeRef.current && epoch === dataEpoch.current,
+      });
       if (
         id === requestId.current &&
         owner === scopeRef.current &&
         epoch === dataEpoch.current
       )
-        setCard({ analysis, demo: !session, document_id: doc.id });
+        setCard({ analysis, demo: !session, document_id: doc.id, source });
     } catch (e) {
       if (id === requestId.current) showError(e);
     } finally {
       if (id === requestId.current) setBusy(false);
     }
   }
+  async function expandAnalysis() {
+    if (!card || expandedLoading || expanded) return;
+    const id = requestId.current,
+      owner = scope,
+      epoch = dataEpoch.current;
+    setExpandedLoading(true);
+    setExpandedError(null);
+    try {
+      const result = await requestAnalysis({
+        mode: "expanded",
+        scope: owner,
+        token: session?.access_token,
+        source: card.source,
+        selection: {
+          word: card.analysis.original_word,
+          sentence: card.analysis.original_sentence,
+          language: card.analysis.language,
+        },
+        compact: card.analysis,
+        canStore: () =>
+          owner === scopeRef.current && epoch === dataEpoch.current,
+      });
+      if (
+        id === requestId.current &&
+        owner === scopeRef.current &&
+        epoch === dataEpoch.current
+      )
+        setExpanded(result);
+    } catch (e) {
+      if (id === requestId.current)
+        setExpandedError(
+          e instanceof Error ? e.message : "Не удалось получить объяснение",
+        );
+    } finally {
+      if (id === requestId.current) setExpandedLoading(false);
+    }
+  }
+
   function captureSelection() {
     const selection = window.getSelection();
     if (
@@ -541,7 +574,7 @@ export default function Lexora() {
     setSaving(true);
     const operationScope = scope;
     try {
-      const a = card.analysis;
+      const a = toCompact(card.analysis);
       const rawKey = JSON.stringify([
         card.document_id,
         a.original_word,
@@ -568,13 +601,13 @@ export default function Lexora() {
         setNotice("Слово уже в словаре");
         return;
       }
-      const entry: Entry = {
+      const entry = compactEntry({
         id: crypto.randomUUID(),
         document_id: card.document_id,
         created_at: new Date().toISOString(),
         analysis: a,
         demo: card.demo,
-      };
+      });
       await cloudWrite("vocabulary_entries", { ...entry, dedupe_key });
       if (scopeRef.current !== operationScope) return;
       setState((s) => ({ ...s, entries: [entry, ...s.entries] }));
@@ -613,44 +646,7 @@ export default function Lexora() {
     }
   }
   function exportWords(format: "json" | "csv") {
-    const entries = state.entries;
-    const safe = (v: string) => (/^[\s]*[=+\-@\t\r]/.test(v) ? "'" + v : v);
-    const text =
-      format === "json"
-        ? JSON.stringify(entries, null, 2)
-        : "\uFEFF" +
-          [
-            [
-              "Слово",
-              "Лемма",
-              "Язык",
-              "Перевод",
-              "Предложение",
-              "Перевод предложения",
-              "Грамматика",
-              "Объяснение",
-              "Документ",
-              "Дата",
-            ],
-            ...entries.map((e) => [
-              e.analysis.original_word,
-              e.analysis.lemma,
-              e.analysis.language,
-              e.analysis.contextual_translation_ru,
-              e.analysis.original_sentence,
-              e.analysis.sentence_translation_ru,
-              e.analysis.grammar_explanation_ru,
-              e.analysis.contextual_explanation_ru,
-              e.document_id || "",
-              e.created_at,
-            ]),
-          ]
-            .map((row) =>
-              row
-                .map((v) => '"' + safe(v).replaceAll('"', '""') + '"')
-                .join(","),
-            )
-            .join("\r\n");
+    const text = vocabularyExport(state.entries, format);
     const url = URL.createObjectURL(
       new Blob([text], {
         type: format === "json" ? "application/json" : "text/csv;charset=utf-8",
@@ -1129,13 +1125,18 @@ export default function Lexora() {
                       <button
                         className="word-open"
                         onClick={() => {
+                          requestId.current++;
+                          setExpanded(null);
+                          setExpandedError(null);
+                          setExpandedLoading(false);
+                          setBusy(false);
                           setAnchor({ x: window.innerWidth - 470, y: 140 });
                           setCard({
                             analysis: e.analysis,
                             demo: e.demo,
                             document_id: e.document_id,
+                            source: { vocabulary_entry_id: e.id },
                           });
-                          setDetail(true);
                         }}
                       >
                         <span className="word-language">
@@ -1167,7 +1168,7 @@ export default function Lexora() {
                             onClick={() =>
                               setState((s) => ({
                                 ...s,
-                                selected: e.document_id,
+                                selected: e.document_id || "",
                               }))
                             }
                           >
@@ -1415,135 +1416,34 @@ export default function Lexora() {
         </div>
       )}
       {(card || busy) && (
-        <section
-          className={
-            "analysis-card" + (view === "/read" ? " word-popover" : "")
-          }
-          role="dialog"
-          aria-label="Анализ слова"
-          style={
-            {
-              left: view === "/read" ? anchor.x : Math.max(12, anchor.x),
-              top: view === "/read" ? anchor.y : Math.max(90, anchor.y),
-              "--card-top":
-                (view === "/read" ? anchor.y : Math.max(90, anchor.y)) + "px",
-            } as React.CSSProperties
-          }
-        >
-          <button
-            className="close"
-            aria-label="Закрыть анализ"
-            onClick={() => {
-              requestId.current++;
-              setCard(null);
-              setBusy(false);
-            }}
-          >
-            ×
-          </button>
-          {busy ? (
-            <div className="analysis-loading">
-              <span className="spinner" />
-              <h3>Разбираемся в контексте…</h3>
-              <p>Ищем смысл, а не просто перевод.</p>
-            </div>
-          ) : (
-            card && (
-              <>
-                <div className="eyebrow">
-                  {card.demo
-                    ? "ДЕМО · ТЕСТОВЫЙ РЕЗУЛЬТАТ"
-                    : "КОНТЕКСТНЫЙ АНАЛИЗ"}
-                </div>
-                <h2>{card.analysis.original_word}</h2>
-                <p className="translation">
-                  {card.analysis.contextual_translation_ru}
-                </p>
-                <div className="lemma">
-                  {card.analysis.lemma}{" "}
-                  <span>· {card.analysis.part_of_speech}</span>
-                </div>
-                <div className="card-tabs">
-                  <button
-                    className={!detail ? "active" : ""}
-                    onClick={() => setDetail(false)}
-                  >
-                    Кратко
-                  </button>
-                  <button
-                    className={detail ? "active" : ""}
-                    onClick={() => setDetail(true)}
-                  >
-                    Подробно
-                  </button>
-                </div>
-                <div className="analysis-content">
-                  <h4>Грамматика</h4>
-                  <p>{card.analysis.grammar_explanation_ru}</p>
-                  <div className="morphology">
-                    {Object.entries(card.analysis.morphology)
-                      .filter(([, v]) => v)
-                      .map(([k, v]) => (
-                        <span key={k}>{v}</span>
-                      ))}
-                  </div>
-                  {detail && (
-                    <>
-                      <h4>В этом контексте</h4>
-                      <p>{card.analysis.contextual_explanation_ru}</p>
-                      <blockquote>
-                        {card.analysis.original_sentence}
-                        <span>{card.analysis.sentence_translation_ru}</span>
-                      </blockquote>
-                      {card.analysis.expression_notes_ru && (
-                        <p>{card.analysis.expression_notes_ru}</p>
-                      )}
-                      {card.analysis.alternative_meanings_ru.length > 0 && (
-                        <>
-                          <h4>Другие значения</h4>
-                          <p>
-                            {card.analysis.alternative_meanings_ru.join(" · ")}
-                          </p>
-                        </>
-                      )}
-                      <h4>Ещё один пример</h4>
-                      <p>
-                        {card.analysis.example_original}
-                        <br />
-                        <span className="muted">
-                          {card.analysis.example_translation_ru}
-                        </span>
-                      </p>
-                      {card.analysis.ambiguity_notes_ru && (
-                        <p className="ambiguity">
-                          {card.analysis.ambiguity_notes_ru}
-                        </p>
-                      )}
-                    </>
-                  )}
-                </div>
-                <button
-                  className="primary save-word"
-                  onClick={saveWord}
-                  disabled={saving}
-                >
-                  {saving
-                    ? "Сохраняем…"
-                    : state.entries.some(
-                          (e) =>
-                            e.document_id === card.document_id &&
-                            e.analysis.original_word ===
-                              card.analysis.original_word &&
-                            e.analysis.original_sentence ===
-                              card.analysis.original_sentence,
-                        )
-                      ? "✓ Уже в словаре"
-                      : "＋ Добавить в словарь"}
-                </button>
-              </>
+        <AnalysisCard
+          analysis={card?.analysis || null}
+          demo={card?.demo ?? !session}
+          loading={busy}
+          expanded={expanded}
+          expandedLoading={expandedLoading}
+          expandedError={expandedError}
+          onExpand={expandAnalysis}
+          onSave={saveWord}
+          saving={saving}
+          saved={
+            !!card &&
+            state.entries.some(
+              (e) =>
+                e.document_id === card.document_id &&
+                e.analysis.original_word === card.analysis.original_word &&
+                e.analysis.original_sentence ===
+                  card.analysis.original_sentence,
             )
-          )}
-        </section>
+          }
+          onClose={() => {
+            requestId.current++;
+            setCard(null);
+            setBusy(false);
+          }}
+          anchored={view === "/read"}
+          anchor={anchor}
+        />
       )}
     </div>
   );

@@ -1,6 +1,6 @@
 /* Only the public app shell is cached. Documents remain in per-account IndexedDB;
    API requests, auth URLs, external requests, and API responses are never cached. */
-const CACHE = 'lexora-shell-v1';
+const CACHE = 'lexora-shell-v2-compact';
 const PAGES = ['/', '/library', '/read', '/vocabulary', '/settings'];
 const ASSETS = [...PAGES, '/manifest.webmanifest', '/icon.svg', '/icon-192.png', '/icon-512.png'];
 self.addEventListener('install', event => {

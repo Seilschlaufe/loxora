@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, it, expect, vi } from "vitest";
-import { demoAnalysis, context } from "../lib/analysis";
+import { demoAnalysis, demoExpanded, context } from "../lib/analysis";
 const mocks = vi.hoisted(() => ({ authorized: vi.fn(), parse: vi.fn() }));
 vi.mock("@/lib/supabase", () => ({ authorized: mocks.authorized }));
 vi.mock("openai", () => ({
@@ -24,7 +24,7 @@ function body(overrides: Record<string, unknown> = {}) {
     ...overrides,
   };
 }
-function request(value = body()) {
+function request(value: unknown = body()) {
   return new Request("http://localhost/api/analyze", {
     method: "POST",
     headers: {
@@ -39,6 +39,7 @@ function database({
   cached = null as unknown,
   cachedAfterLease = null as unknown,
   lease = "ok",
+  vocabulary = null as { analysis: unknown; document_id: string | null } | null,
 } = {}) {
   let cacheReads = 0;
   const upsert = vi.fn().mockResolvedValue({ error: null });
@@ -50,6 +51,7 @@ function database({
       delete: vi.fn(() => chain),
       single: vi.fn(async () => {
         if (table === "documents") return { data: document };
+        if (table === "vocabulary_entries") return { data: vocabulary };
         const item = ++cacheReads === 1 ? cached : cachedAfterLease || cached;
         return { data: item ? { analysis: item } : null };
       }),
@@ -306,5 +308,151 @@ describe("authoritative source fields", () => {
     });
     expect((await POST(request())).status).toBe(502);
     expect(db.upsert).not.toHaveBeenCalled();
+  });
+});
+
+describe("independent compact and explicitly requested expanded analyses", () => {
+  it("uses a compact-only schema and lower token budget on ordinary clicks", async () => {
+    const db = database();
+    mocks.authorized.mockResolvedValue({ db, user: { id: "user-a" } });
+    mocks.parse.mockResolvedValue({
+      output_parsed: demoAnalysis("beschloss", doc.content, "de"),
+    });
+    expect((await POST(request())).status).toBe(200);
+    expect(mocks.parse).toHaveBeenCalledTimes(1);
+    const args = mocks.parse.mock.calls[0][0];
+    expect(args.max_output_tokens).toBe(1200);
+    expect(args.text.format.name).toBe("compact_word_analysis");
+    expect(JSON.stringify(args.text.format.schema)).not.toContain("meaning_ru");
+    expect(JSON.stringify(args.text.format.schema)).not.toContain(
+      "original_sentence",
+    );
+  });
+  it("requests expanded meaning only for explicit mode and stores it under another key", async () => {
+    const db = database();
+    mocks.authorized.mockResolvedValue({ db, user: { id: "user-a" } });
+    const a = demoAnalysis("beschloss", doc.content, "de");
+    mocks.parse.mockResolvedValueOnce({ output_parsed: a });
+    await POST(request());
+    const compactKey = db.upsert.mock.calls[0][0].cache_key;
+    const expanded = demoExpanded(a);
+    mocks.parse.mockResolvedValueOnce({ output_parsed: expanded });
+    const response = await POST(request(body({ mode: "expanded" })));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({
+      analysis: expanded,
+      cached: false,
+    });
+    const args = mocks.parse.mock.calls[1][0];
+    expect(args.max_output_tokens).toBe(1800);
+    expect(args.text.format.name).toBe("expanded_word_meaning");
+    expect(db.upsert.mock.calls[1][0].cache_key).not.toBe(compactKey);
+  });
+  it("opens expanded cache without a key or another model call", async () => {
+    vi.stubEnv("OPENAI_API_KEY", "");
+    const expanded = demoExpanded(demoAnalysis("beschloss", doc.content, "de"));
+    const db = database({ cached: expanded });
+    mocks.authorized.mockResolvedValue({ db, user: { id: "user-a" } });
+    const response = await POST(request(body({ mode: "expanded" })));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ analysis: expanded, cached: true });
+    expect(mocks.parse).not.toHaveBeenCalled();
+  });
+  it("expands an orphan vocabulary snapshot without resurrecting server cache and releases its lease", async () => {
+    const a = demoAnalysis("beschloss", doc.content, "de");
+    const db = database({ vocabulary: { analysis: a, document_id: null } });
+    mocks.authorized.mockResolvedValue({ db, user: { id: "user-a" } });
+    mocks.parse.mockResolvedValue({ output_parsed: demoExpanded(a) });
+    const response = await POST(
+      request({
+        mode: "expanded",
+        vocabulary_entry_id: "ba4720dd-864d-40b1-a3cf-1ffb07ec0f44",
+      }),
+    );
+    expect(response.status).toBe(200);
+    expect(db.from).toHaveBeenCalledWith("vocabulary_entries");
+    expect(db.from).not.toHaveBeenCalledWith("documents");
+    expect(db.upsert).not.toHaveBeenCalled();
+    expect(db.from).toHaveBeenCalledWith("analysis_leases");
+    expect(await response.json()).toEqual({
+      analysis: demoExpanded(a),
+      cached: false,
+    });
+    expect(mocks.parse.mock.calls[0][0].input[1].content).toContain(
+      doc.content,
+    );
+  });
+  it("denies another user vocabulary entry before any paid request", async () => {
+    const db = database();
+    mocks.authorized.mockResolvedValue({ db, user: { id: "user-b" } });
+    const response = await POST(
+      request({
+        mode: "expanded",
+        vocabulary_entry_id: "ba4720dd-864d-40b1-a3cf-1ffb07ec0f44",
+      }),
+    );
+    expect(response.status).toBe(404);
+    expect(mocks.parse).not.toHaveBeenCalled();
+  });
+  it("rebinds compact cached construction positions in another document offset", async () => {
+    const content = "Einleitung. Er steht früh auf.";
+    const sentence = "Er steht früh auf.";
+    const cached = demoAnalysis("auf", sentence, "de");
+    const db = database({ document: { ...doc, content }, cached });
+    mocks.authorized.mockResolvedValue({ db, user: { id: "user-a" } });
+    const start = content.indexOf("auf");
+    const response = await POST(
+      request(body({ selected: "auf", start, end: start + 3 })),
+    );
+    expect(response.status).toBe(200);
+    const { analysis } = await response.json();
+    expect(
+      analysis.construction.parts.map((p: { start: number; end: number }) =>
+        content.slice(p.start, p.end),
+      ),
+    ).toEqual(["steht", "auf"]);
+    expect(analysis.construction.parts[0].start).toBe(content.indexOf("steht"));
+    expect(mocks.parse).not.toHaveBeenCalled();
+  });
+  it("keeps repeated occurrences in one sentence in separate cache keys", async () => {
+    const content = "The bank is opposite the bank.";
+    const db = database({ document: { ...doc, content, language: "en" } });
+    mocks.authorized.mockResolvedValue({ db, user: { id: "user-a" } });
+    mocks.parse.mockResolvedValue({
+      output_parsed: demoAnalysis("bank", content, "en"),
+    });
+    const first = content.indexOf("bank"),
+      last = content.lastIndexOf("bank");
+    await POST(
+      request(body({ selected: "bank", start: first, end: first + 4 })),
+    );
+    await POST(request(body({ selected: "bank", start: last, end: last + 4 })));
+    expect(db.upsert.mock.calls[0][0].cache_key).not.toBe(
+      db.upsert.mock.calls[1][0].cache_key,
+    );
+  });
+});
+
+describe("saved occurrence metadata", () => {
+  it("expands the stored second occurrence instead of silently picking the first", async () => {
+    const sentence = "The bank is opposite the bank.";
+    const offset = sentence.lastIndexOf("bank");
+    const a = {
+      ...demoAnalysis("bank", sentence, "en"),
+      selection_offset: offset,
+    };
+    const db = database({ vocabulary: { analysis: a, document_id: null } });
+    mocks.authorized.mockResolvedValue({ db, user: { id: "user-a" } });
+    mocks.parse.mockResolvedValue({ output_parsed: demoExpanded(a) });
+    const response = await POST(
+      request({
+        mode: "expanded",
+        vocabulary_entry_id: "ba4720dd-864d-40b1-a3cf-1ffb07ec0f44",
+      }),
+    );
+    expect(response.status).toBe(200);
+    const input = JSON.parse(mocks.parse.mock.calls[0][0].input[1].content);
+    expect(input.selection_start).toBe(offset);
+    expect(input.selection_end).toBe(offset + 4);
   });
 });

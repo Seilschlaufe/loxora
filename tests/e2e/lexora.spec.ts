@@ -1,4 +1,5 @@
 import { test, expect, type Page, type Locator } from "@playwright/test";
+import { readFile } from "node:fs/promises";
 
 async function touchOrClick(locator: Locator) {
   if (test.info().project.name === "android") await locator.tap();
@@ -83,8 +84,12 @@ test("add, analyze, cache, save, reopen and delete a vocabulary entry", async ({
   await expect(dialog.getByText("решил", { exact: true })).toBeVisible();
   await expect(dialog).toContainText("ТЕСТОВЫЙ РЕЗУЛЬТАТ");
   await expect(dialog).toContainText("Präteritum");
-  await dialog.getByRole("button", { name: "Подробно" }).click();
-  await expect(dialog).toContainText("тестовая карточка");
+  const compact = dialog.getByTestId("compact-analysis");
+  await expect(compact).not.toContainText("глагол");
+  await expect(compact).not.toContainText("Ещё один пример");
+  await expect(dialog.getByTestId("expanded-analysis")).toHaveCount(0);
+  await dialog.getByRole("button", { name: "Подробнее о значении" }).click();
+  await expect(dialog.getByTestId("expanded-analysis")).toContainText("Демо:");
   await dialog.getByRole("button", { name: "Добавить в словарь" }).click();
   await expect(
     dialog.getByRole("button", { name: "Уже в словаре" }),
@@ -101,7 +106,33 @@ test("add, analyze, cache, save, reopen and delete a vocabulary entry", async ({
   await expect(page.locator(".vocab-row")).toHaveCount(1);
   await page.getByRole("button", { name: /beschloss.*beschließen/ }).click();
   await expect(dialog.getByText("решил", { exact: true })).toBeVisible();
+  // An expanded reader response must never become part of a vocabulary card.
+  await expect(dialog.getByTestId("expanded-analysis")).toHaveCount(0);
+  await expect(
+    dialog.getByRole("button", { name: "Подробнее о значении" }),
+  ).toBeVisible();
   await dialog.getByRole("button", { name: "Закрыть анализ" }).click();
+  const downloadEvent = page.waitForEvent("download");
+  await page.getByRole("button", { name: "JSON", exact: false }).click();
+  const download = await downloadEvent;
+  const file = await download.path();
+  expect(file).toBeTruthy();
+  const exported = JSON.parse(await readFile(file!, "utf8"));
+  expect(exported).toHaveLength(1);
+  expect(exported[0].analysis.original_word).toBe("beschloss");
+  expect(exported[0].analysis.contextual_translation_ru).toBe("решил");
+  for (const key of [
+    "meaning_ru",
+    "contextual_nuance_ru",
+    "distinctions_ru",
+    "alternative_meanings_ru",
+    "expanded",
+    "contextual_explanation_ru",
+    "example_original",
+    "part_of_speech",
+  ]) {
+    expect(JSON.stringify(exported)).not.toContain('"' + key + '"');
+  }
   await page
     .getByRole("button", { name: "Удалить слово beschloss", exact: true })
     .click();
@@ -130,7 +161,10 @@ test("multiword selection uses original expression and preserves paragraphs", as
     dialog.getByRole("heading", { name: "gave up", exact: true }),
   ).toBeVisible();
   await expect(dialog).toContainText("give up");
-  await expect(dialog).toContainText("фразовый глагол");
+  await expect(dialog).toContainText("Past Simple");
+  await expect(dialog.getByTestId("compact-analysis")).not.toContainText(
+    "фразовый глагол",
+  );
 });
 
 test("cached words work offline while new analyses report missing connection", async ({
@@ -252,7 +286,8 @@ test("reader popup stays below word and closes only when the text scrolls", asyn
       return w && d ? Math.round(d.y - (w.y + w.height)) : -1;
     })
     .toBe(8);
-  await dialog.getByRole("button", { name: "Подробно" }).click();
+  await dialog.getByRole("button", { name: "Подробнее о значении" }).click();
+  await expect(dialog.getByTestId("expanded-analysis")).toContainText("Демо:");
   await dialog.evaluate((el) => {
     el.scrollTop = el.scrollHeight;
   });
@@ -261,4 +296,163 @@ test("reader popup stays below word and closes only when the text scrolls", asyn
   await expect(dialog).not.toBeVisible();
   await page.waitForTimeout(300);
   await expect(dialog).not.toBeVisible();
+});
+
+test("both a separated verb and its particle open the complete construction", async ({
+  page,
+}) => {
+  await addText(page, { text: "Er steht jeden Morgen früh auf." });
+  const reader = page.getByTestId("reader-text");
+  const dialog = page.getByRole("dialog", { name: "Анализ слова" });
+  for (const clicked of ["steht", "auf"]) {
+    await touchOrClick(
+      reader.getByRole("button", { name: clicked, exact: true }),
+    );
+    await expect(
+      dialog.getByRole("heading", { name: clicked, exact: true }),
+    ).toBeVisible();
+    await expect(dialog.getByTestId("compact-analysis")).toContainText(
+      "aufstehen",
+    );
+    await expect(dialog.getByTestId("compact-analysis")).toContainText(
+      "встаёт",
+    );
+    await expect(dialog.getByTestId("compact-analysis")).toContainText(
+      "Singular",
+    );
+    await expect(dialog.getByTestId("expanded-analysis")).toHaveCount(0);
+    await dialog.getByRole("button", { name: "Закрыть анализ" }).click();
+  }
+});
+
+test("an unavailable expansion leaves the compact translation usable offline", async ({
+  page,
+  context,
+}) => {
+  await addText(page);
+  const reader = page.getByTestId("reader-text");
+  await touchOrClick(
+    reader.getByRole("button", { name: "beschloss", exact: true }),
+  );
+  const dialog = page.getByRole("dialog", { name: "Анализ слова" });
+  await expect(dialog.getByTestId("compact-analysis")).toContainText("решил");
+  await context.setOffline(true);
+  await dialog.getByRole("button", { name: "Подробнее о значении" }).click();
+  await expect(dialog).toContainText(/подключени|интернет/i);
+  await expect(dialog.getByTestId("compact-analysis")).toContainText("решил");
+  await expect(dialog.locator(".expanded-analysis-points")).toHaveCount(0);
+  await dialog.getByRole("button", { name: "Добавить в словарь" }).click();
+  await expect(
+    dialog.getByRole("button", { name: "Уже в словаре" }),
+  ).toBeVisible();
+  await context.setOffline(false);
+});
+
+test("a cached expansion still requires a click and can reopen offline", async ({
+  page,
+  context,
+}) => {
+  await addText(page);
+  const word = page
+    .getByTestId("reader-text")
+    .getByRole("button", { name: "beschloss", exact: true });
+  await touchOrClick(word);
+  const dialog = page.getByRole("dialog", { name: "Анализ слова" });
+  await dialog.getByRole("button", { name: "Подробнее о значении" }).click();
+  const expanded = dialog.getByTestId("expanded-analysis");
+  await expect(expanded).toContainText("Демо:");
+  const content = await expanded.textContent();
+  await dialog.getByRole("button", { name: "Закрыть анализ" }).click();
+  await context.setOffline(true);
+  await touchOrClick(word);
+  await expect(dialog.getByTestId("expanded-analysis")).toHaveCount(0);
+  await dialog.getByRole("button", { name: "Подробнее о значении" }).click();
+  await expect(expanded).toHaveText(content!);
+  await context.setOffline(false);
+});
+
+test("legacy full vocabulary records display and export only compact data", async ({
+  page,
+}) => {
+  await page.goto("/library");
+  await expect(
+    page.getByRole("heading", { name: /Каждый текст/ }),
+  ).toBeVisible();
+  await page.evaluate(async () => {
+    const db = await new Promise<IDBDatabase>((resolve, reject) => {
+      const req = indexedDB.open("lexora", 1);
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+    await new Promise<void>((resolve, reject) => {
+      const tx = db.transaction("state", "readwrite");
+      const store = tx.objectStore("state");
+      const req = store.get("demo:snapshot");
+      req.onsuccess = () => {
+        const snapshot = req.result;
+        store.put(
+          {
+            ...snapshot,
+            entries: [
+              {
+                id: "legacy-word",
+                document_id: snapshot.docs[0].id,
+                created_at: new Date().toISOString(),
+                demo: true,
+                analysis: {
+                  original_word: "beschloss",
+                  lemma: "beschließen",
+                  language: "de",
+                  contextual_translation_ru: "решил",
+                  original_sentence: "Er beschloss zu gehen.",
+                  part_of_speech: "глагол",
+                  morphology: {
+                    tense: null,
+                    mood: null,
+                    person: null,
+                    number: null,
+                    gender: null,
+                    case: null,
+                    other: "Präteritum, единственное число",
+                  },
+                  grammar_explanation_ru: "Präteritum, единственное число",
+                  contextual_explanation_ru: "UNSAVED_EXPANSION_LEGACY",
+                  sentence_translation_ru: "UNSAVED_EXPANSION_LEGACY",
+                  alternative_meanings_ru: ["UNSAVED_EXPANSION_LEGACY"],
+                  example_original: "UNSAVED_EXPANSION_LEGACY",
+                  example_translation_ru: "UNSAVED_EXPANSION_LEGACY",
+                  expression_notes_ru: null,
+                  ambiguity_notes_ru: null,
+                },
+              },
+            ],
+          },
+          "demo:snapshot",
+        );
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+  });
+  await page.goto("/vocabulary");
+  await expect(page.locator(".vocab-row")).toHaveCount(1);
+  await page.getByRole("button", { name: /beschloss.*beschließen/ }).click();
+  const dialog = page.getByRole("dialog", { name: "Анализ слова" });
+  await expect(dialog.getByTestId("compact-analysis")).toContainText(
+    "Präteritum",
+  );
+  await expect(dialog.getByTestId("compact-analysis")).toContainText(
+    "Singular",
+  );
+  await expect(dialog).not.toContainText("UNSAVED_EXPANSION_LEGACY");
+  await expect(dialog.getByTestId("expanded-analysis")).toHaveCount(0);
+  await dialog.getByRole("button", { name: "Закрыть анализ" }).click();
+  const event = page.waitForEvent("download");
+  await page.getByRole("button", { name: "JSON", exact: false }).click();
+  const download = await event;
+  const text = await readFile((await download.path())!, "utf8");
+  expect(text).not.toContain("UNSAVED_EXPANSION_LEGACY");
+  expect(text).not.toContain("part_of_speech");
+  expect(JSON.parse(text)[0].analysis.original_word).toBe("beschloss");
 });

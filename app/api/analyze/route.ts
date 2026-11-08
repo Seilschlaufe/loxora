@@ -5,18 +5,29 @@ import { createHash } from "node:crypto";
 import { authorized } from "@/lib/supabase";
 import {
   analysisSchema,
+  language,
+  modelAnalysisSchema,
+  expandedSchema,
+  EXPANDED_INSTRUCTIONS,
+  resolveAnalysis,
+  toCompact,
   context,
   PROMPT_VERSION,
   ANALYSIS_INSTRUCTIONS,
 } from "@/lib/analysis";
 export const runtime = "nodejs";
 export const maxDuration = 60;
-const input = z.object({
+const documentInput = z.object({
+  mode: z.enum(["compact", "expanded"]).default("compact"),
   document_id: z.uuid(),
   selected: z.string().min(1).max(200),
   start: z.number().int().min(0),
   end: z.number().int().positive(),
 });
+const input = z.union([
+  documentInput,
+  z.object({ mode: z.literal("expanded"), vocabulary_entry_id: z.uuid() }),
+]);
 export async function POST(req: Request) {
   let stage = "auth";
   try {
@@ -34,26 +45,106 @@ export async function POST(req: Request) {
         { status: 400 },
       );
     const v = parsed.data;
-    const { data: doc } = await db
-      .from("documents")
-      .select("*")
-      .eq("id", v.document_id)
-      .single();
-    if (!doc)
-      return Response.json({ error: "Документ недоступен" }, { status: 404 });
-    if (
-      v.end <= v.start ||
-      v.end > doc.content.length ||
-      doc.content.slice(v.start, v.end) !== v.selected
-    )
-      return Response.json(
-        { error: "Выделение не соответствует документу" },
-        { status: 400 },
+    const mode = v.mode;
+    let selected: string,
+      sentence: string,
+      sourceText: string,
+      selectionStart: number,
+      sourceLanguage: "de" | "en" | "es",
+      documentId: string | null;
+    if ("vocabulary_entry_id" in v) {
+      const { data: entry } = await db
+        .from("vocabulary_entries")
+        .select("analysis,document_id")
+        .eq("id", v.vocabulary_entry_id)
+        .single();
+      if (!entry)
+        return Response.json(
+          { error: "Запись словаря недоступна" },
+          { status: 404 },
+        );
+      const saved = toCompact(entry.analysis);
+      selected = saved.original_word;
+      sentence = saved.original_sentence;
+      // This source comes from the caller's stored row, never a client-supplied card.
+      if (selected.length > 200 || sentence.length > 1800)
+        return Response.json(
+          { error: "Контекст записи слишком большой" },
+          { status: 400 },
+        );
+      sourceText = sentence;
+      const storedOffset = saved.selection_offset;
+      selectionStart =
+        typeof storedOffset === "number" &&
+        sentence.slice(storedOffset, storedOffset + selected.length) ===
+          selected
+          ? storedOffset
+          : sentence.indexOf(selected);
+      sourceLanguage = saved.language;
+      documentId = entry.document_id;
+      if (selectionStart < 0)
+        return Response.json(
+          { error: "Исходное слово отсутствует в контексте записи" },
+          { status: 400 },
+        );
+    } else {
+      const { data: doc } = await db
+        .from("documents")
+        .select("*")
+        .eq("id", v.document_id)
+        .single();
+      if (!doc)
+        return Response.json({ error: "Документ недоступен" }, { status: 404 });
+      if (
+        v.end <= v.start ||
+        v.end > doc.content.length ||
+        doc.content.slice(v.start, v.end) !== v.selected
+      )
+        return Response.json(
+          { error: "Выделение не соответствует документу" },
+          { status: 400 },
+        );
+      selected = v.selected;
+      sentence = context(doc.content, v.start, v.end, doc.language);
+      sourceText = doc.content;
+      selectionStart = v.start;
+      sourceLanguage = language.parse(doc.language);
+      documentId = v.document_id;
+    }
+    const source = {
+      text: sourceText,
+      sentence,
+      selected,
+      start: selectionStart,
+      language: sourceLanguage,
+    };
+    const contextStart = sourceText.lastIndexOf(sentence, selectionStart);
+    const parseCached = (value: unknown) => {
+      if (mode === "expanded") return expandedSchema.parse(value);
+      const compact = analysisSchema.parse(value);
+      return resolveAnalysis(
+        {
+          ...compact,
+          construction: compact.construction
+            ? {
+                ...compact.construction,
+                parts: compact.construction.parts.map((part) => part.text),
+              }
+            : null,
+        },
+        source,
       );
-    const sentence = context(doc.content, v.start, v.end, doc.language);
+    };
     const key = createHash("sha256")
       .update(
-        JSON.stringify([PROMPT_VERSION, doc.language, v.selected, sentence]),
+        JSON.stringify([
+          PROMPT_VERSION,
+          mode,
+          sourceLanguage,
+          selected,
+          sentence,
+          selectionStart - contextStart,
+        ]),
       )
       .digest("hex");
     const { data: cached } = await db
@@ -63,7 +154,7 @@ export async function POST(req: Request) {
       .single();
     if (cached)
       return Response.json({
-        analysis: analysisSchema.parse(cached.analysis),
+        analysis: parseCached(cached.analysis),
         cached: true,
       });
     if (!process.env.OPENAI_API_KEY)
@@ -98,7 +189,7 @@ export async function POST(req: Request) {
         .single();
       if (completed)
         return Response.json({
-          analysis: analysisSchema.parse(completed.analysis),
+          analysis: parseCached(completed.analysis),
           cached: true,
         });
       stage = "model";
@@ -107,46 +198,64 @@ export async function POST(req: Request) {
         timeout: 25000,
         maxRetries: 1,
       });
-      const result = await ai.responses.parse({
-        model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
-        max_output_tokens: 3500,
-        input: [
-          { role: "system", content: ANALYSIS_INSTRUCTIONS },
-          {
-            role: "user",
-            content: JSON.stringify({
-              language: doc.language,
-              selected: v.selected,
-              sentence,
-            }),
-          },
-        ],
-        text: { format: zodTextFormat(analysisSchema, "word_analysis") },
-      });
-      stage = "validate";
-      const a = analysisSchema.parse(result.output_parsed);
-      const normalized = (text: string) =>
-        text.normalize("NFC").replace(/\s+/gu, " ").trim();
-      if (
-        normalized(a.original_word) !== normalized(v.selected) ||
-        a.language !== doc.language
-      )
-        throw Error("Ответ модели не соответствует выделению");
-      // These fields are source data, not model-generated content. Segmenter often
-      // includes trailing spaces/newlines that the model does not echo verbatim.
-      a.original_word = v.selected;
-      a.original_sentence = sentence;
-      stage = "save";
-      const { error } = await db.from("analysis_cache").upsert(
+      const instructions =
+        mode === "compact" ? ANALYSIS_INSTRUCTIONS : EXPANDED_INSTRUCTIONS;
+      const messages = [
+        { role: "system" as const, content: instructions },
         {
-          owner_id: user.id,
-          document_id: v.document_id,
-          cache_key: key,
-          analysis: a,
+          role: "user" as const,
+          content: JSON.stringify({
+            language: sourceLanguage,
+            selected,
+            sentence,
+            selection_start: selectionStart - contextStart,
+            selection_end: selectionStart - contextStart + selected.length,
+          }),
         },
-        { onConflict: "owner_id,cache_key" },
-      );
-      if (error) throw error;
+      ];
+      // The expanded schema is never requested by a compact click.
+      const result =
+        mode === "compact"
+          ? await ai.responses.parse({
+              model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+              max_output_tokens: 1200,
+              input: messages,
+              text: {
+                format: zodTextFormat(
+                  modelAnalysisSchema,
+                  "compact_word_analysis",
+                ),
+              },
+            })
+          : await ai.responses.parse({
+              model: process.env.OPENAI_MODEL || "gpt-4.1-mini",
+              max_output_tokens: 1800,
+              input: messages,
+              text: {
+                format: zodTextFormat(expandedSchema, "expanded_word_meaning"),
+              },
+            });
+      stage = "validate";
+      const a =
+        mode === "compact"
+          ? resolveAnalysis(result.output_parsed, source)
+          : expandedSchema.parse(result.output_parsed);
+      // A surviving vocabulary snapshot may have no document after deletion.
+      // Avoid recreating unbound server data if that row/all data is deleted
+      // while this request runs. Its result is cached only by the caller's client.
+      if (documentId !== null) {
+        stage = "save";
+        const { error } = await db.from("analysis_cache").upsert(
+          {
+            owner_id: user.id,
+            document_id: documentId,
+            cache_key: key,
+            analysis: a,
+          },
+          { onConflict: "owner_id,cache_key" },
+        );
+        if (error) throw error;
+      }
       return Response.json({ analysis: a, cached: false });
     } finally {
       await db.from("analysis_leases").delete().eq("cache_key", key);
