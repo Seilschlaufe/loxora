@@ -230,3 +230,35 @@ test("installed service worker reopens the saved reader after an offline reload"
   ).toBeVisible();
   await context.setOffline(false);
 });
+
+test("reader popup stays below word and closes only when the text scrolls", async ({
+  page,
+}) => {
+  await addText(page, {
+    text:
+      "Er beschloss zu gehen.\n\n" +
+      "Ein langer Absatz mit vielen Wörtern.\n\n".repeat(100),
+  });
+  const word = page
+    .getByTestId("reader-text")
+    .getByRole("button", { name: "beschloss", exact: true });
+  await touchOrClick(word);
+  const dialog = page.getByRole("dialog", { name: "Анализ слова" });
+  await expect(dialog.getByText("решил", { exact: true })).toBeVisible();
+  await expect
+    .poll(async () => {
+      const w = await word.boundingBox(),
+        d = await dialog.boundingBox();
+      return w && d ? Math.round(d.y - (w.y + w.height)) : -1;
+    })
+    .toBe(8);
+  await dialog.getByRole("button", { name: "Подробно" }).click();
+  await dialog.evaluate((el) => {
+    el.scrollTop = el.scrollHeight;
+  });
+  await expect(dialog).toBeVisible();
+  await page.evaluate(() => window.scrollBy(0, 150));
+  await expect(dialog).not.toBeVisible();
+  await page.waitForTimeout(300);
+  await expect(dialog).not.toBeVisible();
+});

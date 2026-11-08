@@ -78,6 +78,7 @@ export default function Lexora() {
   const [selection, setSelection] = useState<{
       start: number;
       end: number;
+      rect: DOMRect;
     } | null>(null),
     [anchor, setAnchor] = useState({ x: 0, y: 0 });
   const [email, setEmail] = useState(""),
@@ -301,7 +302,7 @@ export default function Lexora() {
           'button:not(:disabled), input, select, textarea, a[href], [tabindex="0"]',
         ),
       );
-    focusables()[0]?.focus();
+    focusables()[0]?.focus({ preventScroll: true });
     const trap = (e: KeyboardEvent) => {
       if (e.key !== "Tab") return;
       const nodes = focusables();
@@ -333,6 +334,21 @@ export default function Lexora() {
     window.addEventListener("keydown", handler);
     return () => window.removeEventListener("keydown", handler);
   }, []);
+  useEffect(() => {
+    if (view !== "/read") return;
+    const dismiss = () => {
+      requestId.current++;
+      setCard(null);
+      setBusy(false);
+      setSelection(null);
+    };
+    window.addEventListener("scroll", dismiss, { passive: true });
+    window.addEventListener("resize", dismiss);
+    return () => {
+      window.removeEventListener("scroll", dismiss);
+      window.removeEventListener("resize", dismiss);
+    };
+  }, [view]);
   async function cloudWrite(
     table: string,
     data: Record<string, unknown>,
@@ -432,11 +448,15 @@ export default function Lexora() {
     setCard(null);
     setDetail(false);
     setBusy(true);
-    if (rect)
+    if (rect) {
+      const width = Math.min(420, window.innerWidth - 24);
       setAnchor({
-        x: Math.min(rect.left, window.innerWidth - 440),
-        y: Math.min(rect.bottom + 12, window.innerHeight - 520),
+        x:
+          window.scrollX +
+          Math.max(12, Math.min(rect.left, window.innerWidth - width - 12)),
+        y: rect.bottom + 8,
       });
+    }
     const sentence = context(doc.content, start, end, doc.language),
       key = JSON.stringify([PROMPT_VERSION, doc.language, word, sentence]);
     try {
@@ -514,7 +534,7 @@ export default function Lexora() {
     before.setEnd(range.startContainer, range.startOffset);
     const start = before.toString().length,
       end = start + range.toString().length;
-    setSelection({ start, end });
+    setSelection({ start, end, rect: range.getBoundingClientRect() });
   }
   async function saveWord() {
     if (!card || saving) return;
@@ -1022,7 +1042,13 @@ export default function Lexora() {
                       <button
                         className="selection-action primary"
                         onMouseDown={(e) => e.preventDefault()}
-                        onClick={() => analyze(selection.start, selection.end)}
+                        onClick={() =>
+                          analyze(
+                            selection.start,
+                            selection.end,
+                            selection.rect,
+                          )
+                        }
                       >
                         Проанализировать выражение
                       </button>
@@ -1390,14 +1416,17 @@ export default function Lexora() {
       )}
       {(card || busy) && (
         <section
-          className="analysis-card"
+          className={
+            "analysis-card" + (view === "/read" ? " word-popover" : "")
+          }
           role="dialog"
           aria-label="Анализ слова"
           style={
             {
-              left: Math.max(12, anchor.x),
-              top: Math.max(90, anchor.y),
-              "--card-top": Math.max(90, anchor.y) + "px",
+              left: view === "/read" ? anchor.x : Math.max(12, anchor.x),
+              top: view === "/read" ? anchor.y : Math.max(90, anchor.y),
+              "--card-top":
+                (view === "/read" ? anchor.y : Math.max(90, anchor.y)) + "px",
             } as React.CSSProperties
           }
         >

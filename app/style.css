@@ -1367,7 +1367,7 @@ textarea {
   .reader-text {
     line-height: 1.95;
   }
-  .analysis-card {
+  .analysis-card:not(.word-popover) {
     left: 0 !important;
     top: auto !important;
     bottom: 70px;
@@ -1476,5 +1476,29 @@ textarea {
   *:after {
     animation: none !important;
     transition: none !important;
+  }
+}
+
+/* Reader cards always start below their source word, including on phones.
+   Only the card itself scrolls; scrolling the document dismisses it. */
+.analysis-card.word-popover {
+  position: fixed;
+  bottom: auto;
+  width: min(420px, calc(100vw - 24px));
+  max-height: max(120px, min(560px, calc(100dvh - var(--card-top) - 20px)));
+  overscroll-behavior: contain;
+  overflow-anchor: none;
+}
+@media (max-width: 760px) {
+  .analysis-card.word-popover {
+    left: auto;
+    top: auto;
+    bottom: auto;
+    border-radius: 12px;
+    padding: 20px;
+    max-height: max(100px, min(500px, calc(100dvh - var(--card-top) - 82px)));
+  }
+  .analysis-card.word-popover:before {
+    display: none;
   }
 }
