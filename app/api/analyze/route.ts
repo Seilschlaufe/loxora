@@ -18,6 +18,7 @@ const input = z.object({
   end: z.number().int().positive(),
 });
 export async function POST(req: Request) {
+  let stage = "auth";
   try {
     const { db, user } = await authorized(req);
     if (Number(req.headers.get("content-length") || 0) > 4096)
@@ -100,6 +101,7 @@ export async function POST(req: Request) {
           analysis: analysisSchema.parse(completed.analysis),
           cached: true,
         });
+      stage = "model";
       const ai = new OpenAI({
         apiKey: process.env.OPENAI_API_KEY,
         timeout: 25000,
@@ -121,6 +123,7 @@ export async function POST(req: Request) {
         ],
         text: { format: zodTextFormat(analysisSchema, "word_analysis") },
       });
+      stage = "validate";
       const a = analysisSchema.parse(result.output_parsed);
       if (
         a.original_word !== v.selected ||
@@ -128,6 +131,7 @@ export async function POST(req: Request) {
         a.language !== doc.language
       )
         throw Error("Ответ модели не соответствует выделению");
+      stage = "save";
       const { error } = await db.from("analysis_cache").upsert(
         {
           owner_id: user.id,
@@ -151,6 +155,90 @@ export async function POST(req: Request) {
       );
     if (e instanceof SyntaxError)
       return Response.json({ error: "Некорректный JSON" }, { status: 400 });
+    // Expose only known categories, never raw provider messages, keys or document text.
+    if (stage === "save")
+      return Response.json(
+        {
+          error:
+            "Анализ получен, но не сохранён. Проверьте миграцию Supabase и наличие исходного документа.",
+        },
+        { status: 503 },
+      );
+    if (stage === "validate")
+      return Response.json(
+        {
+          error:
+            "Модель вернула некорректный разбор или изменила исходный текст. Повторите анализ.",
+        },
+        { status: 502 },
+      );
+    if (stage === "model") {
+      const provider =
+        e && typeof e === "object"
+          ? (e as { code?: unknown; status?: unknown; name?: unknown })
+          : {};
+      if (provider.code === "insufficient_quota")
+        return Response.json(
+          {
+            error:
+              "У OpenAI API закончилась квота или не настроена оплата. Проверьте Billing на platform.openai.com. Подписка ChatGPT не оплачивает API.",
+          },
+          { status: 503 },
+        );
+      if (provider.status === 401)
+        return Response.json(
+          {
+            error:
+              "OpenAI отклонил API-ключ. Проверьте OPENAI_API_KEY в .env.local и перезапустите приложение.",
+          },
+          { status: 502 },
+        );
+      if (provider.code === "model_not_found" || provider.status === 404)
+        return Response.json(
+          {
+            error:
+              "Модель OpenAI недоступна. Проверьте OPENAI_MODEL и доступ к модели в своём API-проекте.",
+          },
+          { status: 503 },
+        );
+      if (provider.status === 429)
+        return Response.json(
+          {
+            error:
+              "OpenAI временно ограничил запросы. Подождите минуту и проверьте лимиты API-проекта.",
+          },
+          { status: 429, headers: { "Retry-After": "60" } },
+        );
+      if (provider.status === 403)
+        return Response.json(
+          {
+            error:
+              "OpenAI запретил запрос. Проверьте права API-ключа и доступность API для вашего аккаунта и региона.",
+          },
+          { status: 503 },
+        );
+      if (provider.name === "APIConnectionTimeoutError")
+        return Response.json(
+          { error: "OpenAI не ответил вовремя. Повторите запрос позже." },
+          { status: 504 },
+        );
+      if (provider.name === "APIConnectionError")
+        return Response.json(
+          {
+            error:
+              "Не удалось подключиться к OpenAI. Проверьте интернет и доступ к api.openai.com.",
+          },
+          { status: 502 },
+        );
+      if (provider.status === 400 || provider.status === 422)
+        return Response.json(
+          {
+            error:
+              "OpenAI отклонил параметры анализа. Проверьте поддержку Responses API и Structured Outputs выбранной моделью.",
+          },
+          { status: 502 },
+        );
+    }
     const auth = message === "AUTH";
     return Response.json(
       {

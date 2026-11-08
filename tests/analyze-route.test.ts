@@ -234,3 +234,49 @@ describe("cache, quotas, model response and failure handling", () => {
     expect(mocks.parse).not.toHaveBeenCalled();
   });
 });
+
+describe("actionable analysis failures without secret leakage", () => {
+  it.each([
+    [{ status: 429, code: "insufficient_quota" }, 503, "Billing"],
+    [{ status: 401 }, 502, "API-ключ"],
+    [{ status: 404, code: "model_not_found" }, 503, "OPENAI_MODEL"],
+    [{ status: 429, code: "rate_limit_exceeded" }, 429, "ограничил"],
+    [{ status: 403 }, 503, "запретил"],
+    [{ name: "APIConnectionTimeoutError" }, 504, "вовремя"],
+    [{ name: "APIConnectionError" }, 502, "подключиться"],
+    [{ status: 400 }, 502, "параметры"],
+  ])("classifies %j safely", async (error, status, expected) => {
+    const db = database();
+    mocks.authorized.mockResolvedValue({ db, user: { id: "user-a" } });
+    mocks.parse.mockRejectedValue({
+      ...error,
+      message: "SECRET-KEY-DO-NOT-LEAK",
+    });
+    const response = await POST(request());
+    expect(response.status).toBe(status);
+    const text = await response.text();
+    expect(text).toContain(expected);
+    expect(text).not.toContain("SECRET-KEY-DO-NOT-LEAK");
+    expect(db.upsert).not.toHaveBeenCalled();
+    expect(db.from).toHaveBeenCalledWith("analysis_leases");
+  });
+  it("distinguishes storage errors from a failed model call", async () => {
+    const db = database();
+    mocks.authorized.mockResolvedValue({ db, user: { id: "user-a" } });
+    mocks.parse.mockResolvedValue({
+      output_parsed: demoAnalysis(
+        "beschloss",
+        context(doc.content, 3, 12, "de"),
+        "de",
+      ),
+    });
+    db.upsert.mockResolvedValue({
+      error: { message: "SECRET DATABASE DETAILS" },
+    } as never);
+    const response = await POST(request());
+    expect(response.status).toBe(503);
+    const text = await response.text();
+    expect(text).toContain("не сохранён");
+    expect(text).not.toContain("SECRET DATABASE DETAILS");
+  });
+});
