@@ -125,12 +125,17 @@ export async function POST(req: Request) {
       });
       stage = "validate";
       const a = analysisSchema.parse(result.output_parsed);
+      const normalized = (text: string) =>
+        text.normalize("NFC").replace(/\s+/gu, " ").trim();
       if (
-        a.original_word !== v.selected ||
-        a.original_sentence !== sentence ||
+        normalized(a.original_word) !== normalized(v.selected) ||
         a.language !== doc.language
       )
         throw Error("Ответ модели не соответствует выделению");
+      // These fields are source data, not model-generated content. Segmenter often
+      // includes trailing spaces/newlines that the model does not echo verbatim.
+      a.original_word = v.selected;
+      a.original_sentence = sentence;
       stage = "save";
       const { error } = await db.from("analysis_cache").upsert(
         {

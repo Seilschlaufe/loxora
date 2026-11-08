@@ -280,3 +280,31 @@ describe("actionable analysis failures without secret leakage", () => {
     expect(text).not.toContain("SECRET DATABASE DETAILS");
   });
 });
+
+describe("authoritative source fields", () => {
+  it("restores source sentence and whitespace without rejecting a valid analysis", async () => {
+    const db = database();
+    mocks.authorized.mockResolvedValue({ db, user: { id: "user-a" } });
+    const source = context(doc.content, 3, 12, "de");
+    mocks.parse.mockResolvedValue({
+      output_parsed: {
+        ...demoAnalysis(" beschloss ", source.trim(), "de"),
+        original_sentence: "Er beschloss zu gehen.",
+      },
+    });
+    const response = await POST(request());
+    expect(response.status).toBe(200);
+    const { analysis } = await response.json();
+    expect(analysis.original_word).toBe("beschloss");
+    expect(analysis.original_sentence).toBe(source);
+  });
+  it("rejects a response in another language", async () => {
+    const db = database();
+    mocks.authorized.mockResolvedValue({ db, user: { id: "user-a" } });
+    mocks.parse.mockResolvedValue({
+      output_parsed: demoAnalysis("beschloss", doc.content, "en"),
+    });
+    expect((await POST(request())).status).toBe(502);
+    expect(db.upsert).not.toHaveBeenCalled();
+  });
+});

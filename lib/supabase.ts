@@ -1,9 +1,23 @@
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 
+// Persist through route remounts, Strict Mode and development hot reload.
+const browserState = globalThis as typeof globalThis & {
+  __lexoraSupabase?: {
+    url: string;
+    key: string;
+    client: SupabaseClient;
+  };
+};
 export function browserDb() {
+  if (typeof window === "undefined") return null;
   const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-  return url && key ? createClient(url, key) : null;
+  if (!url || !key) return null;
+  const existing = browserState.__lexoraSupabase;
+  if (existing?.url === url && existing.key === key) return existing.client;
+  const client = createClient(url, key);
+  browserState.__lexoraSupabase = { url, key, client };
+  return client;
 }
 
 export function serverDb(token: string) {
